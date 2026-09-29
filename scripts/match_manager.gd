@@ -1,0 +1,1017 @@
+class_name MatchManager
+extends Node
+## Spawns the two battalions - several companies a side - runs a sergeant per company and a
+## captain per side, keeps the score. A company's sergeant is its steadiest man still standing;
+## what he "orders" is a blend of his own traits and his company's, and his men follow it only as
+## far as their own traits take them - see soldier.gd. The captain only places companies,
+## sends in the reserve and lets a rout in one company be felt by its neighbours.
+
+signal match_started(match_index: int)
+signal match_ended(result: Dictionary)
+
+const MAX_SIZE := 20            # men in one company
+const MAX_COMPANIES := 6
+const MAX_SIDE := 80            # men a side, all companies together
+const CO_NAMES := ["A", "B", "C", "D", "E", "F"]
+const SLOTS := ["Left", "Centre-left", "Centre-right", "Right", "Reserve"]
+const SLOT_X := [37.5, 12.5, -12.5, -37.5, 0.0]   # from the side's own left (Red's left is +x)
+const CAPTAIN_TICK := 1.0
+## Battalion presets: [personality, type, slot] per company.
+const BATTALIONS := {
+	"Line battalion": [["Regulars", "Even", "Left"], ["Regulars", "Even", "Centre-left"], ["Regulars", "Even", "Centre-right"], ["Regulars", "Even", "Right"]],
+	"Light battalion": [["Skirmishers", "Marksman", "Left"], ["Regulars", "Even", "Centre-left"], ["Regulars", "Even", "Centre-right"], ["Skirmishers", "Marksman", "Right"]],
+	"Assault column": [["Regulars", "Even", "Left"], ["Shock", "Grenadier", "Centre-left"], ["Shock", "Grenadier", "Centre-right"], ["Regulars", "Even", "Right"]],
+	"Mixed": [["Skirmishers", "Marksman", "Left"], ["Regulars", "Even", "Centre-left"], ["Regulars", "Even", "Centre-right"], ["Shock", "Grenadier", "Reserve"]],
+	"Old guard": [["Veterans", "Ironside", "Left"], ["Veterans", "Ironside", "Centre-left"], ["Veterans", "Marksman", "Centre-right"], ["Skirmishers", "Marksman", "Right"]],
+}
+const BATTALION_HELP := {
+	"Line battalion": "Four companies of regulars shoulder to shoulder across the front",
+	"Light battalion": "Skirmishers on both flanks, a line in the centre",
+	"Assault column": "Two storming companies in the centre, regulars holding the flanks",
+	"Mixed": "A skirmish screen, two line companies, and a storming party in reserve",
+	"Old guard": "Three companies of veterans and a screen of marksmen",
+}
+const TEAM_NAMES := ["Red", "Blue"]
+const TEAM_COLORS := [Color(0.8, 0.22, 0.2), Color(0.2, 0.35, 0.8)]
+const SERGEANT_TICK := 0.5
+const VOLLEY_COOLDOWN := 2.5
+
+static var TEAM_SIZE := 20
+
+var world: Node3D
+var field: Field
+var headless := false
+var team_personalities: Array[Personality] = [Personality.preset("Regulars"), Personality.preset("Skirmishers")]
+var team_preset_names: Array[String] = ["Regulars", "Skirmishers"]
+var team_types: Array[SoldierType] = [SoldierType.preset("Even"), SoldierType.preset("Even")]
+var team_type_names: Array[String] = ["Even", "Even"]
+var team_sizes := [TEAM_SIZE, TEAM_SIZE]   # the SELECTED company's size, per side (see select_company)
+## The battalions: per side, an Array of company dictionaries
+## {name, size, persona: Personality, persona_name, type: SoldierType, type_name, slot}.
+## team_personalities / team_types / team_sizes / *_names above are a view of the company the
+## setup panel has selected (`sel`), so the one-company editor works unchanged on each company.
+var companies: Array = [[], []]
+var battalion_names := ["Mixed", "Line battalion"]
+var sel := [0, 0]
+var side_n := [0, 0]            # men fielded at the start, per side
+var co_n := {}                  # ck -> men fielded at the start
+var committed := {}             # ck -> x the reserve was sent to
+var co_labels: Dictionary = {}  # ck -> Label3D over the company
+## Campaign rosters: per team, the men to field this round as records
+## {name, seed, kills, rounds, recruit}. Empty means a fresh company of team_sizes[t].
+var rosters: Array = [[], []]
+
+var soldiers: Array[Soldier] = []
+var orders: Array = [[], []]     # per side, one order dict per company
+var sergeants: Dictionary = {}   # ck -> Soldier
+var elapsed := 0.0
+var time_limit := -1.0
+var running := false
+var match_index := 0
+var rng := RandomNumberGenerator.new()
+var stats := {}
+var _tick := 0.0
+var _spot_claims := {}   # "x,z" -> soldier
+var _last_volley_t := {}   # ck -> time
+var _volley_ids := {}
+var _charge_since := {}
+var _exch := {}            # ck -> [hits given, hits taken] lately (decays)
+var _last_harm_t := 0.0    # when anyone last hit anyone
+var _press_since := {}
+var _fallback_since := {}
+var _captain_tick := 0.0
+var _fight_cache := [[], []]
+var _fight_frame := -1
+var _grid := {}
+var _grid_frame := -1
+var _alive_cache: Array[Soldier] = []
+var _cache_frame := -1
+var _hist_frame := -1
+
+
+func _init() -> void:
+	set_battalion(0, "Mixed")
+	set_battalion(1, "Line battalion")
+
+
+## A short name for what a side fielded: its preset if it still is one, else the companies.
+func battalion_label(t: int) -> String:
+	var cos: Array = companies[t]
+	var spec: Array = BATTALIONS.get(battalion_names[t], [])
+	if spec.size() == cos.size():
+		var same := true
+		for c in cos.size():
+			var co: Dictionary = cos[c]
+			if co["persona_name"] != spec[c][0] or co["type_name"] != spec[c][1] or co["slot"] != spec[c][2]:
+				same = false
+				break
+		if same:
+			return battalion_names[t]
+	var parts := []
+	for co in cos:
+		parts.append(String(co["persona_name"]).substr(0, 4))
+	return "/".join(parts)
+
+
+static func ck(t: int, c: int) -> int:
+	return t * MAX_COMPANIES + c
+
+
+func new_company(t: int, c: int, persona_name: String, type_name: String, slot: String, size: int) -> Dictionary:
+	return {"name": CO_NAMES[c] if c < CO_NAMES.size() else str(c + 1), "size": size,
+		"persona": Personality.preset(persona_name), "persona_name": persona_name,
+		"type": SoldierType.preset(type_name), "type_name": type_name, "slot": slot}
+
+
+## Fill a side from a battalion preset, `per` men a company.
+func set_battalion(t: int, bname: String, per: int = 10) -> void:
+	var spec: Array = BATTALIONS.get(bname, BATTALIONS["Line battalion"])
+	var cos := []
+	for c in spec.size():
+		var row: Array = spec[c]
+		cos.append(new_company(t, c, row[0], row[1], row[2], per))
+	companies[t] = cos
+	battalion_names[t] = bname
+	sel[t] = 0
+	select_company(t, 0)
+
+
+## Load a company into the one-company view the editor works on.
+func select_company(t: int, c: int) -> void:
+	var cos: Array = companies[t]
+	c = clampi(c, 0, cos.size() - 1)
+	sel[t] = c
+	var co: Dictionary = cos[c]
+	team_personalities[t] = co["persona"]
+	team_preset_names[t] = co["persona_name"]
+	team_types[t] = co["type"]
+	team_type_names[t] = co["type_name"]
+	team_sizes[t] = co["size"]
+
+
+## Write the view back into the selected company.
+func store_company(t: int) -> void:
+	var co: Dictionary = companies[t][sel[t]]
+	co["persona"] = team_personalities[t]
+	co["persona_name"] = team_preset_names[t]
+	co["type"] = team_types[t]
+	co["type_name"] = team_type_names[t]
+	co["size"] = clampi(int(team_sizes[t]), 1, MAX_SIZE)
+
+
+func side_total(t: int) -> int:
+	var n := 0
+	for co in companies[t]:
+		n += int(co["size"])
+	return n
+
+
+func add_company(t: int) -> void:
+	var cos: Array = companies[t]
+	if cos.size() >= MAX_COMPANIES:
+		return
+	var src: Dictionary = cos[sel[t]]
+	var co := new_company(t, cos.size(), src["persona_name"], src["type_name"], "Reserve", mini(int(src["size"]), MAX_SIDE - side_total(t)))
+	co["persona"] = (src["persona"] as Personality).jittered(rng, 0.0)
+	co["type"] = (src["type"] as SoldierType).copy()
+	if int(co["size"]) < 1:
+		return
+	cos.append(co)
+	select_company(t, cos.size() - 1)
+
+
+func remove_company(t: int) -> void:
+	var cos: Array = companies[t]
+	if cos.size() <= 1:
+		return
+	cos.remove_at(sel[t])
+	for c in cos.size():
+		cos[c]["name"] = CO_NAMES[c]
+	select_company(t, mini(sel[t], cos.size() - 1))
+
+
+## Where a company stands across the front: its slot's x in the side's own frame.
+func band_x(t: int, c: int) -> float:
+	var k := ck(t, c)
+	if committed.has(k):
+		return committed[k]
+	var slot: String = companies[t][c]["slot"]
+	var i := SLOTS.find(slot)
+	return SLOT_X[maxi(i, 0)] * (1.0 if t == 0 else -1.0)
+
+
+func is_reserve(t: int, c: int) -> bool:
+	return String(companies[t][c]["slot"]) == "Reserve" and not committed.has(ck(t, c))
+
+
+func toward(t: int) -> float:
+	return signf(-home_z(t))
+
+
+func home_z(team: int) -> float:
+	return -(Field.HALF_Z - 6.0) if team == 0 else (Field.HALF_Z - 6.0)
+
+
+func start_match(seed_value: int = -1) -> void:
+	clear()
+	match_index += 1
+	if seed_value >= 0:
+		rng.seed = seed_value
+	else:
+		rng.randomize()
+	elapsed = 0.0
+	stats = _fresh_stats()
+	for t in 2:
+		store_company(t)
+		var roster: Array = rosters[t]
+		var cos: Array = companies[t]
+		orders[t] = []
+		side_n[t] = 0
+		var per_slot := {}
+		for c in cos.size():
+			var co: Dictionary = cos[c]
+			var k := ck(t, c)
+			# this company's men: its campaign records, or a fresh company of its size
+			var recs := []
+			for r in roster:
+				if int(r.get("co", 0)) == c:
+					recs.append(r)
+			var n: int = recs.size() if not roster.is_empty() else clampi(int(co["size"]), 1, MAX_SIZE)
+			co_n[k] = n
+			side_n[t] += n
+			var order := _blank_order(t, n)
+			var reserve: bool = String(co["slot"]) == "Reserve"
+			var stack: int = int(per_slot.get(co["slot"], 0))
+			per_slot[co["slot"]] = stack + 1
+			var z0: float = home_z(t) + toward(t) * (0.0 if reserve else 22.0) - toward(t) * 8.0 * stack
+			order["line_z"] = z0
+			order["rally_z"] = z0
+			order["center_x"] = band_x(t, c)
+			order["spacing"] = 1.2
+			orders[t].append(order)
+			_last_volley_t[k] = -100.0
+			_volley_ids[k] = 0
+			_charge_since[k] = -1.0
+			_press_since[k] = -1.0
+			_fallback_since[k] = -1.0
+			_exch[k] = [0.0, 0.0]
+			if n == 0:
+				continue
+			for i in n:
+				var rec: Dictionary = recs[i] if not roster.is_empty() else {}
+				var s := Soldier.new()
+				s.team = t
+				s.company = c
+				s.team_color = TEAM_COLORS[t]
+				s.soldier_name = rec.get("name", "%s%s %d" % [TEAM_NAMES[t][0], co["name"], i + 1])
+				# a man's own quirks come from his seed, so a veteran is the same man every round
+				var prng := RandomNumberGenerator.new()
+				prng.seed = int(rec.get("seed", rng.randi()))
+				s.personality = (co["persona"] as Personality).jittered(prng, 0.1)
+				s.soldier_type = (co["type"] as SoldierType).jittered(prng, 0.02)
+				s.kills = int(rec.get("kills", 0))
+				s.rounds = int(rec.get("rounds", 0))
+				s.record_seed = prng.seed
+				s.manager = self
+				s.field = field
+				s.slot = i
+				s.rng = RandomNumberGenerator.new()
+				s.rng.seed = rng.randi()
+				var x: float = band_x(t, c) + (float(i) - float(n - 1) * 0.5) * 1.2
+				s.position = Vector3(x, field.height_at(x, z0), z0)
+				s.rotation.y = 0.0 if t == 0 else PI
+				s.fired.connect(_on_fired)
+				s.damaged.connect(_on_damaged)
+				s.died.connect(_on_died)
+				s.routed.connect(_on_routed)
+				s.fled.connect(_on_fled)
+				s.thrust.connect(_on_thrust)
+				world.add_child(s)
+				soldiers.append(s)
+			if not headless:
+				var lab := Label3D.new()
+				lab.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+				lab.no_depth_test = true
+				lab.fixed_size = true
+				lab.pixel_size = 0.0022
+				lab.font_size = 34
+				lab.outline_size = 10
+				lab.modulate = TEAM_COLORS[t].lightened(0.45)
+				lab.text = String(co["name"])
+				lab.position = Vector3(band_x(t, c), z0 + 5.0, z0)
+				lab.position = Vector3(band_x(t, c), field.height_at(band_x(t, c), z0) + 5.0, z0)
+				world.add_child(lab)
+				co_labels[k] = lab
+	running = true
+	match_started.emit(match_index)
+
+
+func _blank_order(t: int, n: int) -> Dictionary:
+	return {"mode": "advance", "line_z": home_z(t), "rally_z": home_z(t), "center_x": 0.0, "spacing": 1.0,
+		"count": n, "volley_id": 0, "volley_age": 999.0, "alone": false, "sergeant": "", "press": false, "seek_cover": false}
+
+
+func clear() -> void:
+	for k in co_labels:
+		if is_instance_valid(co_labels[k]):
+			co_labels[k].queue_free()
+	co_labels.clear()
+	committed.clear()
+	sergeants.clear()
+	for s in soldiers:
+		if is_instance_valid(s):
+			if s.ragdoll != null and is_instance_valid(s.ragdoll):
+				s.ragdoll.queue_free()
+			s.queue_free()
+	soldiers.clear()
+	_spot_claims.clear()
+	_last_volley_t = {}
+	_charge_since = {}
+	_fallback_since = {}
+	_exch = {}
+	_last_harm_t = 0.0
+	_press_since = {}
+	_fight_frame = -1
+	_grid_frame = -1
+	running = false
+	_cache_frame = -1
+
+
+func _fresh_stats() -> Dictionary:
+	return {
+		"shots": [0, 0], "hits": [0, 0], "kills": [[0, 0], [0, 0]],   # kills[t] = [rifle, bayonet]
+		"volleys": [0, 0], "charges": [0, 0], "fallbacks": [0, 0], "routed": [0, 0], "fled": [0, 0],
+		"friendly": [0, 0], "thrusts": [0, 0], "thrust_hits": [0, 0], "wounds": [0, 0],
+	}
+
+
+# ---------------------------------------------------------------- queries the men use
+
+func alive_soldiers() -> Array[Soldier]:
+	var f := Engine.get_physics_frames()
+	if f == _cache_frame:
+		return _alive_cache
+	_cache_frame = f
+	_alive_cache = []
+	for s in soldiers:
+		if s.alive and not s.gone:
+			_alive_cache.append(s)
+	return _alive_cache
+
+
+## Men still in the fight: alive, on the field, and not running for the rear.
+func fighting(team: int) -> Array[Soldier]:
+	# asked for hundreds of times a frame with a battalion a side: worked out once per frame
+	var f := Engine.get_physics_frames()
+	if f != _fight_frame:
+		_fight_frame = f
+		var a: Array[Soldier] = []
+		var b: Array[Soldier] = []
+		for s in alive_soldiers():
+			if not s.is_routed:
+				if s.team == 0:
+					a.append(s)
+				else:
+					b.append(s)
+		_fight_cache = [a, b]
+	return _fight_cache[team]
+
+
+func fighting_company(team: int, c: int) -> Array[Soldier]:
+	var out: Array[Soldier] = []
+	for s in fighting(team):
+		if s.company == c:
+			out.append(s)
+	return out
+
+
+## Losses of one company, against the men it fielded.
+func company_losses(t: int, c: int) -> float:
+	var n: int = int(co_n.get(ck(t, c), 0))
+	if n == 0:
+		return 1.0
+	var a := 0
+	for s in alive_soldiers():
+		if s.team == t and s.company == c:
+			a += 1
+	return 1.0 - float(a) / float(n)
+
+
+func alive_count(team: int) -> int:
+	var n := 0
+	for s in alive_soldiers():
+		if s.team == team:
+			n += 1
+	return n
+
+
+func loss_fraction(team: int) -> float:
+	var n: int = side_n[team]
+	return 1.0 - float(alive_count(team)) / maxf(float(n), 1.0)
+
+
+func strength_ratio(team: int) -> float:
+	var mine := fighting(team).size()
+	var theirs := fighting(1 - team).size()
+	return float(mine) / maxf(float(theirs), 1.0)
+
+
+func nearest_enemy(s: Soldier) -> Soldier:
+	var best: Soldier = null
+	var best_d := INF
+	for o in alive_soldiers():
+		if o.team == s.team:
+			continue
+		var d := o.global_position.distance_squared_to(s.global_position)
+		# a man who has broken is a poorer target than one still fighting, unless he is close
+		if o.is_routed:
+			d *= 1.6
+		if d < best_d:
+			best_d = d
+			best = o
+	return best
+
+
+## A friend standing within a shoulder of the line of fire, closer than the target.
+func friend_in_line(s: Soldier, enemy: Soldier) -> Soldier:
+	var a := s.global_position
+	var b := enemy.global_position
+	var ab := b - a
+	ab.y = 0.0
+	var len := ab.length()
+	if len < 0.5:
+		return null
+	var dir := ab / len
+	for o in alive_soldiers():
+		if o == s or o.team != s.team:
+			continue
+		var ao := o.global_position - a
+		ao.y = 0.0
+		var along := ao.dot(dir)
+		if along < 0.6 or along > len - 0.5:
+			continue
+		var side := (ao - dir * along).length()
+		if side < 0.55 and not o.kneeling:
+			return o
+		if side < 0.3:
+			return o
+	return null
+
+
+## The first man - either side - standing near the ball's path beyond the target.
+func stray_victim(s: Soldier, from: Vector3, to: Vector3) -> Soldier:
+	var dir := to - from
+	dir.y = 0.0
+	var len := dir.length()
+	if len < 0.5:
+		return null
+	dir /= len
+	var best: Soldier = null
+	var best_along := INF
+	for o in alive_soldiers():
+		if o == s:
+			continue
+		var ao := o.global_position - from
+		ao.y = 0.0
+		var along := ao.dot(dir)
+		if along < len + 0.5 or along > Soldier.MAX_RANGE + 40.0:
+			continue
+		var side := (ao - dir * along).length()
+		if side < 0.7 and along < best_along:
+			best_along = along
+			best = o
+	return best
+
+
+## Push away from men standing too close (both sides), so a line keeps its interval and a
+## melee is a scrum rather than a stack.
+func separation(s: Soldier) -> Vector3:
+	var push := Vector3.ZERO
+	var p := s.global_position
+	# a 4 m grid, rebuilt once a frame: a man only looks at the nine cells round him
+	var f := Engine.get_physics_frames()
+	if f != _grid_frame:
+		_grid_frame = f
+		_grid = {}
+		for o in alive_soldiers():
+			var key := Vector2i(floori(o.global_position.x / 4.0), floori(o.global_position.z / 4.0))
+			if not _grid.has(key):
+				_grid[key] = []
+			_grid[key].append(o)
+	var cx := floori(p.x / 4.0)
+	var cz := floori(p.z / 4.0)
+	var near := []
+	for dx in [-1, 0, 1]:
+		for dz in [-1, 0, 1]:
+			near.append_array(_grid.get(Vector2i(cx + dx, cz + dz), []))
+	for o: Soldier in near:
+		if o == s:
+			continue
+		var d := p - o.global_position
+		d.y = 0.0
+		var l := d.length()
+		if l < 0.75 and l > 0.001:
+			push += d / l * (0.75 - l) * 2.5
+	return push
+
+
+## How far this man is ahead (toward the enemy) of the mean of his fighting mates.
+func ahead_of_line(s: Soldier) -> float:
+	var men := fighting_company(s.team, s.company)
+	if men.size() < 2:
+		return 0.0
+	var z := 0.0
+	for m in men:
+		z += m.global_position.z
+	z /= men.size()
+	return (s.global_position.z - z) * signf(-home_z(s.team))
+
+
+func claim_spot(s: Soldier, spot: Dictionary) -> bool:
+	var key := "%.1f,%.1f" % [(spot["pos"] as Vector3).x, (spot["pos"] as Vector3).z]
+	var holder = _spot_claims.get(key)
+	if holder == null or not is_instance_valid(holder) or not holder.alive or holder.gone or holder == s:
+		# drop this man's old claim
+		for k in _spot_claims.keys():
+			if _spot_claims[k] == s:
+				_spot_claims.erase(k)
+		_spot_claims[key] = s
+		return true
+	return false
+
+
+# ---------------------------------------------------------------- the company labels
+
+const MODE_GLYPH := {"advance": "»", "hold": "■", "at_will": "■", "charge": "⚔", "fallback": "«"}
+
+
+func _process(_delta: float) -> void:
+	if not running or co_labels.is_empty():
+		return
+	for t in 2:
+		for c in (companies[t] as Array).size():
+			var k := ck(t, c)
+			if not co_labels.has(k):
+				continue
+			var lab: Label3D = co_labels[k]
+			var men := fighting_company(t, c)
+			if men.is_empty():
+				lab.visible = false
+				continue
+			var cen := Vector3.ZERO
+			var top := -INF
+			for m in men:
+				cen += m.global_position
+				top = maxf(top, m.global_position.y)
+			cen /= men.size()
+			lab.visible = true
+			lab.position = Vector3(cen.x, top + 4.0, cen.z)
+			var mode: String = orders[t][c].get("mode", "")
+			var glyph: String = "·" if is_reserve(t, c) else MODE_GLYPH.get(mode, "")
+			lab.text = "%s %s %d" % [companies[t][c]["name"], glyph, men.size()]
+
+
+# ---------------------------------------------------------------- the sergeants
+
+func _physics_process(delta: float) -> void:
+	if not running:
+		return
+	elapsed += delta
+	for t in 2:
+		for c in (orders[t] as Array).size():
+			orders[t][c]["volley_age"] = elapsed - float(_last_volley_t.get(ck(t, c), -100.0))
+	_tick -= delta
+	if _tick <= 0.0:
+		_tick = SERGEANT_TICK
+		for t in 2:
+			for c in (orders[t] as Array).size():
+				_run_sergeant(t, c)
+	_captain_tick -= delta
+	if _captain_tick <= 0.0:
+		_captain_tick = CAPTAIN_TICK
+		for t in 2:
+			_run_captain(t)
+	# the fight is over when one side has nobody left standing on the field
+	var f0 := fighting(0).size()
+	var f1 := fighting(1).size()
+	if f0 == 0 and f1 == 0:
+		end_match("mutual rout")
+	elif f0 == 0:
+		end_match("Red broken")
+	elif f1 == 0:
+		end_match("Blue broken")
+	elif time_limit > 0.0 and elapsed >= time_limit:
+		end_match("time")
+	elif elapsed > 120.0 and elapsed - _last_harm_t > 45.0:
+		# nobody has hurt anybody for over a minute: the day is decided on harm done
+		end_match("stalemate")
+
+
+## The line's mind. Traits are the sergeant's own blended half-and-half with his men's mean,
+## so a company of cowards with one iron sergeant still holds better than one without him.
+func _run_sergeant(t: int, c: int) -> void:
+	var k := ck(t, c)
+	var men := fighting_company(t, c)
+	var order: Dictionary = orders[t][c]
+	order["count"] = maxi(men.size(), 1)
+	order["alone"] = men.size() <= 2
+	if men.is_empty():
+		return
+	# pick the sergeant and hand out slots left-to-right by current x, so the line doesn't cross
+	var sgt: Soldier = null
+	var best := -1.0
+	for m in men:
+		var v := m.p("discipline") + m.p("nerve")
+		if v > best:
+			best = v
+			sgt = m
+	if sergeants.get(k) != sgt:
+		sergeants[k] = sgt
+		order["sergeant"] = sgt.soldier_name
+	var sorted := men.duplicate()
+	sorted.sort_custom(func(a, b): return a.global_position.x < b.global_position.x)
+	for i in sorted.size():
+		sorted[i].slot = i
+	var mix := {}
+	for tr in Personality.TRAITS:
+		var mean := 0.0
+		for m in men:
+			mean += m.p(tr)
+		mean /= men.size()
+		mix[tr] = 0.5 * sgt.p(tr) + 0.5 * mean
+	var enemies := fighting(1 - t)
+	if enemies.is_empty():
+		enemies = []
+		for s in alive_soldiers():
+			if s.team != t:
+				enemies.append(s)
+	var centre := Vector3.ZERO
+	for m in men:
+		centre += m.global_position
+	centre /= men.size()
+	# the enemy this company faces: the ten men of theirs nearest to it, not the whole battalion
+	var by_d := []
+	for e in enemies:
+		by_d.append([e.global_position.distance_squared_to(centre), e])
+	by_d.sort_custom(func(a, b): return a[0] < b[0])
+	var near_e := []
+	for i in mini(10, by_d.size()):
+		near_e.append(by_d[i][1])
+	var enemy_centre := Vector3.ZERO
+	var nearest_d := INF
+	for e in near_e:
+		enemy_centre += e.global_position
+		nearest_d = minf(nearest_d, e.global_position.distance_to(centre))
+	if not near_e.is_empty():
+		enemy_centre /= near_e.size()
+	var toward := signf(-home_z(t))   # +1 for red (marching +z), -1 for blue
+	var loaded_frac := 0.0
+	var in_range := 0
+	var engage: float = 68.0 - 42.0 * float(mix["patience"])
+	# can the line see the enemy at all? A hill between them and there is nothing to hold for
+	var seen := true
+	if not near_e.is_empty() and not field.hills.is_empty() and nearest_d < Soldier.MAX_RANGE + 10.0:
+		seen = false
+		var eye := Vector3(0, Soldier.EYE_HEIGHT, 0)
+		for e in near_e:
+			if field.line_of_fire(sgt.global_position + eye, e.global_position + Vector3(0, 1.0, 0)) > 0.0:
+				seen = true
+				break
+		if not seen:
+			for m in men:
+				if m == sgt:
+					continue
+				if field.line_of_fire(m.global_position + eye, enemy_centre + Vector3(0, 1.0, 0)) > 0.0:
+					seen = true
+					break
+	if not seen:
+		nearest_d = INF   # out of sight is out of range: the line goes and finds them
+	for m in men:
+		if m.loaded:
+			loaded_frac += 1.0
+		if not enemies.is_empty() and m.global_position.distance_to(enemy_centre) <= engage:
+			in_range += 1
+	loaded_frac /= men.size()
+
+	order["spacing"] = 0.8 + (1.0 - mix["cohesion"]) * 3.0
+	# the line's centre creeps toward the enemy's, a sergeant with cohesion keeps it together
+	# ... within its own stretch of the front: the captain gives each company a band
+	var bx := band_x(t, c)
+	order["center_x"] = lerpf(order["center_x"], clampf(enemy_centre.x if not near_e.is_empty() else bx, bx - 15.0, bx + 15.0), 0.06)
+
+	var mean_courage := 0.0
+	for m in men:
+		mean_courage += m.courage
+	mean_courage /= men.size()
+	var losses := loss_fraction(t)
+
+	# --- the exchange: a sergeant can count. Taking two balls for every one he gives while
+	# the enemy sits behind walls is a firefight lost, and standing in it is not a plan.
+	_exch[k][0] *= 0.98
+	_exch[k][1] *= 0.98
+	var given: float = _exch[k][0]
+	var taken: float = _exch[k][1]
+	var losing_fire: bool = not enemies.is_empty() and taken >= 2.0 * given + 2.0 and nearest_d < engage + 15.0
+	# ... and if nobody has hurt anybody for a while, somebody has to go and find the enemy
+	var stalled: bool = not enemies.is_empty() and elapsed > 30.0 and elapsed - _last_harm_t > 25.0 and nearest_d > 22.0
+	var pressing: bool = _press_since[k] >= 0.0
+	if pressing and (nearest_d < 22.0 or enemies.is_empty()):
+		_press_since[k] = -1.0
+		pressing = false
+	if stalled and not pressing and mix["aggression"] >= 0.15:
+		_press_since[k] = elapsed
+		pressing = true
+
+	# --- the reserve stands where it was put until the captain sends it in, or the enemy comes to it
+	if is_reserve(t, c):
+		if nearest_d <= engage:
+			committed[k] = clampf(centre.x, -Field.HALF_X + 10.0, Field.HALF_X - 10.0)
+		else:
+			order["mode"] = "hold"
+			return
+
+	# --- mode
+	var mode: String = order["mode"]
+	if mode == "charge":
+		# the charge runs until the enemy is broken off or the blood cools
+		if enemies.is_empty() or nearest_d > 40.0 or (elapsed - _charge_since[k] > 25.0 and nearest_d > 6.0):
+			mode = "advance"
+	elif mode == "fallback":
+		var rallied := absf(centre.z - order["rally_z"]) < 6.0
+		if rallied and (loaded_frac > 0.6 or elapsed - _fallback_since[k] > 20.0):
+			mode = "hold"
+	if mode != "charge" and mode != "fallback":
+		# fall back: losses or a bad exchange, and a sergeant with the nerve to admit it
+		var break_point: float = 0.25 + 0.5 * float(mix["nerve"])
+		if losses > break_point and mean_courage < 0.45 and mix["aggression"] < 0.75 and nearest_d < 40.0:
+			mode = "fallback"
+			order["rally_z"] = clampf(centre.z - toward * 22.0, -Field.HALF_Z + 4.0, Field.HALF_Z - 4.0)
+			_fallback_since[k] = elapsed
+			stats["fallbacks"][t] += 1
+		else:
+			# the charge: close enough, and either the volley is just gone or the fight is going our way
+			var charge_range: float = 12.0 + 32.0 * float(mix["aggression"])
+			var just_volleyed: bool = elapsed - float(_last_volley_t[k]) < 4.0
+			var ratio := strength_ratio(t)
+			if losing_fire:
+				# the bayonet decides what the rifle cannot: a sergeant with any blood in him
+				# closes, and a shy one either finds a wall of his own or gets out of range
+				charge_range += 20.0
+			if not enemies.is_empty() and nearest_d < charge_range and mix["aggression"] > (0.2 if losing_fire else 0.35) \
+				and (just_volleyed or loaded_frac < 0.35 or mix["aggression"] > 0.85 or losing_fire) \
+				and ratio > (0.4 if losing_fire else 0.5 + (1.0 - mix["aggression"]) * 0.6):
+				mode = "charge"
+				_charge_since[k] = elapsed
+				_press_since[k] = -1.0
+				stats["charges"][t] += 1
+			elif losing_fire and mix["aggression"] <= 0.2 and mix["cover"] < 0.5:
+				mode = "fallback"
+				order["rally_z"] = clampf(centre.z - toward * 25.0, -Field.HALF_Z + 4.0, Field.HALF_Z - 4.0)
+				_fallback_since[k] = elapsed
+				stats["fallbacks"][t] += 1
+			elif losing_fire and mix["aggression"] > 0.2:
+				mode = "advance"
+				if not pressing:
+					_press_since[k] = elapsed
+					pressing = true
+			elif not enemies.is_empty() and nearest_d <= engage and not pressing:
+				mode = "hold"
+			else:
+				mode = "advance"
+	order["mode"] = mode
+	order["press"] = pressing and mode == "advance"
+	order["seek_cover"] = losing_fire
+	if mode == "charge":
+		# a line coming on with the bayonet is a fearful thing before it ever arrives
+		for e in enemies:
+			var close := 0
+			for m in men:
+				if m.charging and m.global_position.distance_to(e.global_position) < 15.0:
+					close += 1
+			if close >= 3:
+				# ... and loose order cannot receive one: a man with nobody at his elbow
+				# feels three bayonets as thirty
+				var loose: float = 1.0 + 2.5 * e.alone
+				e.fear = minf(e.fear + 0.03 * (1.0 - 0.5 * e.p("nerve")) * loose, 0.6 + 0.35 * e.alone)
+
+	# --- where the line stands
+	match mode:
+		"advance":
+			var step: float = 1.4 * SERGEANT_TICK * (0.6 + 0.8 * float(mix["aggression"]))
+			var target_z: float = order["line_z"] + toward * step
+			# a cover-minded sergeant halts the line on a wall he can reach before the enemy does
+			# - unless the line is pressing in, when walls are for after the volley at twenty paces
+			if mix["cover"] > 0.45 and not pressing:
+				var wall_z := _cover_row_ahead(t, order["line_z"], engage, enemy_centre)
+				if not is_nan(wall_z) and (target_z - wall_z) * toward > 0.0:
+					target_z = wall_z
+			order["line_z"] = clampf(target_z, -Field.HALF_Z + 3.0, Field.HALF_Z - 3.0)
+		"hold":
+			# keep the range: if the enemy pulls back out of reach, follow at the walk
+			if not enemies.is_empty() and (nearest_d > engage + 8.0 or pressing):
+				order["line_z"] += toward * 1.0 * SERGEANT_TICK
+			# ... and a hot-blooded sergeant still edges in
+			elif mix["aggression"] > 0.6 and nearest_d > 20.0:
+				order["line_z"] += toward * 0.5 * SERGEANT_TICK
+		"fallback":
+			order["line_z"] = order["rally_z"]
+		"charge":
+			order["line_z"] = centre.z
+
+	# --- the volley: enough men loaded and in range, and it's been a moment since the last
+	if mode != "charge" and mode != "fallback" and not enemies.is_empty():
+		var ready := 0
+		for m in men:
+			if m.loaded and m.global_position.distance_to(enemy_centre) <= engage + 10.0:
+				ready += 1
+		var need: float = 0.45 + 0.4 * float(mix["discipline"])
+		if float(ready) / men.size() >= need and elapsed - _last_volley_t[k] > VOLLEY_COOLDOWN + 4.0 * mix["patience"]:
+			_call_volley(t, c)
+		elif mix["discipline"] < 0.35:
+			order["mode"] = "at_will" if mode == "hold" else mode
+
+
+## The z of the nearest low wall or fence row between the line and the engagement distance,
+## on the near side of it; NAN if there is none.
+func _cover_row_ahead(t: int, line_z: float, engage: float, enemy_centre: Vector3) -> float:
+	var toward := signf(-home_z(t))
+	var best := NAN
+	var best_d := INF
+	for pc in field.pieces:
+		if pc["tall"]:
+			continue
+		var r: Rect2 = pc["rect"]
+		if r.size.x < 4.0:
+			continue   # only long rows can hold a line
+		var z := r.get_center().y - toward * (r.size.y * 0.5 + 0.9)
+		var ahead := (z - line_z) * toward
+		if ahead < -1.0:
+			continue
+		if absf(enemy_centre.z - z) < 12.0:
+			continue   # the enemy is already on it
+		if absf(enemy_centre.z - z) > engage + 6.0:
+			continue   # too far back to fire from; the line would stand there for nothing
+		if ahead < best_d:
+			best_d = ahead
+			best = z
+	return best
+
+
+func _call_volley(t: int, c: int) -> void:
+	var k := ck(t, c)
+	_last_volley_t[k] = elapsed
+	_volley_ids[k] = int(_volley_ids.get(k, 0)) + 1
+	orders[t][c]["volley_id"] = _volley_ids[k]
+	orders[t][c]["volley_age"] = 0.0
+	stats["volleys"][t] += 1
+
+
+# ---------------------------------------------------------------- events
+
+## The shock of a volley: balls arriving together frighten the men around the mark, hit or
+## miss, far more than the same balls one at a time. Only shots fired on the word count.
+func volley_pressure(shooter: Soldier, mark: Vector3, hit: bool) -> void:
+	var o: Dictionary = orders[shooter.team][shooter.company]
+	if float(o.get("volley_age", 999.0)) > 1.2:
+		return
+	for s in alive_soldiers():
+		if s.team == shooter.team:
+			continue
+		var d := s.global_position.distance_to(mark)
+		if d < 5.0:
+			s.fear = minf(s.fear + (0.05 if hit else 0.025) * (1.0 - d / 5.0) + 0.01, 0.6)
+
+
+func _on_fired(s: Soldier, victim: Soldier, hit: bool) -> void:
+	stats["shots"][s.team] += 1
+	if hit and victim.team != s.team:
+		stats["hits"][s.team] += 1
+		_exch[ck(s.team, s.company)][0] += 1.0
+		_exch[ck(victim.team, victim.company)][1] += 1.0
+		_last_harm_t = elapsed
+	elif hit:
+		stats["friendly"][s.team] += 1
+
+
+func _on_damaged(s: Soldier, amount: float, _source: String, _attacker: Soldier) -> void:
+	if amount < Soldier.MAX_HP and s.alive:
+		stats["wounds"][s.team] += 1
+
+
+func _on_died(s: Soldier, source: String, attacker: Soldier) -> void:
+	if attacker != null and attacker.team != s.team:
+		stats["kills"][attacker.team][1 if source == "bayonet" else 0] += 1
+	for o in alive_soldiers():
+		if o.team == s.team:
+			o.notice_death(s.global_position)
+	for k in _spot_claims.keys():
+		if _spot_claims[k] == s:
+			_spot_claims.erase(k)
+
+
+func _on_routed(s: Soldier) -> void:
+	stats["routed"][s.team] += 1
+	# a rout is felt by the next company along: men of other companies within 40 m see it go
+	for o in fighting(s.team):
+		if o.company != s.company and o.global_position.distance_to(s.global_position) < 40.0:
+			o.fear = minf(o.fear + 0.05 * (1.0 - 0.5 * o.p("nerve")), 0.6)
+
+
+## The captain: every second, sends the reserve where the line is going worst - or where it is
+## going best, if he has the blood for it - and keeps the company labels over their men.
+func _run_captain(t: int) -> void:
+	var cos: Array = companies[t]
+	var agg := 0.0
+	for co in cos:
+		agg += (co["persona"] as Personality).get_trait("aggression")
+	agg /= maxf(cos.size(), 1)
+	for c in cos.size():
+		if not is_reserve(t, c) or fighting_company(t, c).is_empty():
+			continue
+		# the worst-off company in the line, and the best
+		var worst := -1
+		var worst_l := 0.0
+		for o in cos.size():
+			if o == c or is_reserve(t, o):
+				continue
+			var l := company_losses(t, o)
+			if fighting_company(t, o).is_empty():
+				l = 1.0
+			if l > worst_l:
+				worst_l = l
+				worst = o
+		var trigger := 0.45 - 0.25 * agg   # an eager captain sends it in sooner
+		if worst >= 0 and worst_l >= trigger:
+			committed[ck(t, c)] = band_x(t, worst)
+		elif elapsed > 90.0 and agg > 0.6 and strength_ratio(t) > 1.3:
+			committed[ck(t, c)] = 0.0   # the day is going our way: finish it
+
+
+func _on_fled(s: Soldier) -> void:
+	stats["fled"][s.team] += 1
+
+
+func _on_thrust(s: Soldier, landed: bool) -> void:
+	stats["thrusts"][s.team] += 1
+	if landed:
+		stats["thrust_hits"][s.team] += 1
+
+
+func _types_label(t: int) -> String:
+	var parts := []
+	for co in companies[t]:
+		parts.append(String(co["type_name"]).substr(0, 4))
+	return "/".join(parts)
+
+
+## Each side's companies as fielded: for the results panels.
+func _company_summary() -> Array:
+	var out := [[], []]
+	for t in 2:
+		for c in (companies[t] as Array).size():
+			var co: Dictionary = companies[t][c]
+			out[t].append({"name": co["name"], "persona": co["persona_name"], "type": co["type_name"], "slot": co["slot"],
+				"size": int(co_n.get(ck(t, c), co["size"]))})
+	return out
+
+
+func end_match(reason: String) -> void:
+	if not running:
+		return
+	running = false
+	var f := [fighting(0).size(), fighting(1).size()]
+	var a := [alive_count(0), alive_count(1)]
+	var winner := -1
+	if f[0] > 0 and f[1] == 0:
+		winner = 0
+	elif f[1] > 0 and f[0] == 0:
+		winner = 1
+	elif reason == "time" or reason == "stalemate":
+		# on the clock, the ground decides: the side whose line stands further into the
+		# enemy's country holds the field. A company that only ever gives ground has lost it.
+		# Harm done breaks a tie.
+		var g := [0.0, 0.0]
+		for t in 2:
+			var men := fighting(t)
+			for m in men:
+				g[t] += m.global_position.z * signf(-home_z(t))   # metres past the centre line, toward the enemy
+			g[t] = g[t] / maxf(float(men.size()), 1.0)
+		var s0: int = stats["kills"][0][0] + stats["kills"][0][1]
+		var s1: int = stats["kills"][1][0] + stats["kills"][1][1]
+		if absf(g[0] - g[1]) > 4.0:
+			winner = 0 if g[0] > g[1] else 1
+			reason += ", " + ("Red" if winner == 0 else "Blue") + " holds the ground"
+		elif s0 != s1:
+			winner = 0 if s0 > s1 else 1
+	var per := []
+	for s in soldiers:
+		per.append({"name": s.soldier_name, "team": s.team, "alive": s.alive, "routed": s.is_routed, "gone": s.gone,
+			"seed": s.record_seed, "rounds": s.rounds, "career_kills": s.kills,
+			"shots": s.shots, "hits": s.hits, "kills": s.kills - s.kills_before, "bayonet_kills": s.bayonet_kills,
+			"thrusts": s.thrusts, "thrust_hits": s.thrust_hits, "dmg": s.dmg_done, "hp": s.hp,
+			"persona": s.personality.label(), "type": s.soldier_type.label(), "company": s.company})
+	var result := {"match": match_index, "winner": winner, "winner_name": TEAM_NAMES[winner] if winner >= 0 else "Draw",
+		"reason": reason, "duration": elapsed, "alive": a, "fighting": f, "stats": stats.duplicate(true),
+		"sizes": side_n.duplicate(), "soldiers": per, "companies": _company_summary(),
+		"presets": [battalion_label(0), battalion_label(1)], "types": [_types_label(0), _types_label(1)]}
+	match_ended.emit(result)
