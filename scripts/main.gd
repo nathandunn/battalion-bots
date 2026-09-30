@@ -389,8 +389,10 @@ func _next_round() -> void:
 	var last := campaign_round >= CAMPAIGN_ROUNDS
 	for t in 2:
 		var roster: Array = campaign_rosters[t].duplicate(true)
+		if campaign_round > 1:
+			_merge_broken(t, roster)
 		if not last:
-			# every company back to its size with recruits; a company wiped out is struck off
+			# every company back to its size with recruits; a company with nobody left is struck off
 			for c in (manager.companies[t] as Array).size():
 				var co: Dictionary = manager.companies[t][c]
 				var have := 0
@@ -415,6 +417,41 @@ func _next_round() -> void:
 ## The computer's choice of personality for its side, applied to the manager for the coming
 ## round. Opening round: any of the five. After that: answer what the enemy fielded, unless
 ## the last round was won, in which case keep the winning choice 70 % of the time.
+## A company cut down to a handful (fewer than 3 men, or under a quarter of its size) is broken
+## up: whoever is left joins the nearest company along the line that still has men, and the
+## broken company is struck off. A company with nobody left is simply struck off.
+func _merge_broken(t: int, roster: Array) -> void:
+	var cos: Array = manager.companies[t]
+	var have := {}
+	for r in roster:
+		var c: int = int(r.get("co", 0))
+		have[c] = int(have.get(c, 0)) + 1
+	for c in cos.size():
+		var n: int = int(have.get(c, 0))
+		if n == 0 or (n >= 3 and n * 4 >= int(cos[c]["size"])):
+			continue
+		# the nearest company along the line (by slot) that is not itself broken
+		var slot_i := MatchManager.SLOTS.find(String(cos[c]["slot"]))
+		var best := -1
+		var best_d := 99
+		for o in cos.size():
+			var on: int = int(have.get(o, 0))
+			if o == c or on < 3 or on * 4 < int(cos[o]["size"]):
+				continue
+			var d: int = absi(MatchManager.SLOTS.find(String(cos[o]["slot"])) - slot_i)
+			if d < best_d:
+				best_d = d
+				best = o
+		if best < 0:
+			continue   # nobody fit to take them in: they stay a (small) company of their own
+		for r in roster:
+			if int(r.get("co", 0)) == c:
+				r["co"] = best
+				r["merged_from"] = String(cos[c]["name"])
+		have[best] = int(have.get(best, 0)) + n
+		have[c] = 0
+
+
 ## The computer's picks for a whole battalion: a doctrine per company, answering the enemy
 ## battalion's average temper, never the same doctrine for every company.
 func _ai_pick(t: int, opening: bool) -> String:
