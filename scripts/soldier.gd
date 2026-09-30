@@ -744,6 +744,7 @@ func _build_body() -> void:
 	label.no_depth_test = true
 	label.position = Vector3(0, 2.35, 0)
 	label.modulate = Color(1, 1, 1, 0.7)
+	label.visible = false   # no name tag over each man; the company label above says who they are
 	add_child(label)
 	# hp bar
 	var bar_bg := MeshInstance3D.new()
