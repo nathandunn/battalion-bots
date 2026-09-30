@@ -73,6 +73,7 @@ var side_n := [0, 0]            # men fielded at the start, per side
 var co_n := {}                  # ck -> men fielded at the start
 var committed := {}             # ck -> x the reserve was sent to
 var co_labels: Dictionary = {}  # ck -> Label3D over the company
+var co_bars: Dictionary = {}    # ck -> [QuadMesh fill, starting men] - strength bar under the label
 ## Campaign rosters: per team, the men to field this round as records
 ## {name, seed, kills, rounds, recruit}. Empty means a fresh company of team_sizes[t].
 var rosters: Array = [[], []]
@@ -309,15 +310,19 @@ func start_match(seed_value: int = -1) -> void:
 				lab.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 				lab.no_depth_test = true
 				lab.fixed_size = true
-				lab.pixel_size = 0.0022
+				lab.pixel_size = LABEL_PX
 				lab.font_size = 16
-				lab.outline_size = 4
+				lab.outline_size = 3
 				lab.modulate = TEAM_COLORS[t].lightened(0.45)
 				lab.text = String(co["name"])
 				lab.position = Vector3(band_x(t, c), z0 + 5.0, z0)
 				lab.position = Vector3(band_x(t, c), field.height_at(band_x(t, c), z0) + 5.0, z0)
 				world.add_child(lab)
 				co_labels[k] = lab
+				# strength bar under the letter: starts full, shrinks as the company loses men
+				var fill := _bar_quad(lab, Color(0.1, 0.1, 0.1, 0.75), BAR_W + 0.002, BAR_H + 0.002, 0.0, 0)
+				fill = _bar_quad(lab, TEAM_COLORS[t].lightened(0.35), BAR_W, BAR_H, 0.0, 1)
+				co_bars[k] = [fill, n]
 	running = true
 	match_started.emit(match_index)
 
@@ -332,6 +337,7 @@ func clear() -> void:
 		if is_instance_valid(co_labels[k]):
 			co_labels[k].queue_free()
 	co_labels.clear()
+	co_bars.clear()
 	committed.clear()
 	sergeants.clear()
 	for s in soldiers:
@@ -558,6 +564,33 @@ func claim_spot(s: Soldier, spot: Dictionary) -> bool:
 
 # ---------------------------------------------------------------- the company labels
 
+const LABEL_PX := 0.0008      # company label: world units per font pixel, at fixed screen size
+const BAR_W := 0.028          # strength bar, same fixed-size units as the label
+const BAR_H := 0.0035
+const BAR_Y := -0.013         # below the letter
+
+
+## A flat billboard quad that keeps its size on screen, drawn over everything, as a child of `lab`.
+func _bar_quad(lab: Node3D, col: Color, w: float, h: float, x: float, prio: int) -> QuadMesh:
+	var mi := MeshInstance3D.new()
+	var q := QuadMesh.new()
+	q.size = Vector2(w, h)
+	q.center_offset = Vector3(x, BAR_Y, 0)
+	mi.mesh = q
+	var m := StandardMaterial3D.new()
+	m.albedo_color = col
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	m.fixed_size = true
+	m.no_depth_test = true
+	m.render_priority = prio
+	mi.material_override = m
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	lab.add_child(mi)
+	return q
+
+
 const MODE_GLYPH := {"advance": "»", "hold": "■", "at_will": "■", "charge": "⚔", "fallback": "«"}
 
 
@@ -584,7 +617,12 @@ func _process(_delta: float) -> void:
 			lab.position = Vector3(cen.x, top + 4.0, cen.z)
 			var mode: String = orders[t][c].get("mode", "")
 			var glyph: String = "·" if is_reserve(t, c) else MODE_GLYPH.get(mode, "")
-			lab.text = "%s %s %d" % [companies[t][c]["name"], glyph, men.size()]
+			lab.text = "%s %s" % [companies[t][c]["name"], glyph]
+			if co_bars.has(k):
+				var q: QuadMesh = co_bars[k][0]
+				var frac: float = clampf(float(men.size()) / maxf(float(co_bars[k][1]), 1.0), 0.0, 1.0)
+				q.size.x = BAR_W * frac
+				q.center_offset = Vector3(-BAR_W * (1.0 - frac) * 0.5, BAR_Y, 0)
 
 
 # ---------------------------------------------------------------- the sergeants
