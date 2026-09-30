@@ -140,15 +140,15 @@ func new_company(t: int, c: int, persona_name: String, type_name: String, slot: 
 		"type": SoldierType.preset(type_name), "type_name": type_name, "slot": slot}
 
 
-## Fill a side from a battalion preset, `per` men a company. Companies that already exist keep
-## their size, and the company being edited stays selected.
-func set_battalion(t: int, bname: String, per: int = 10) -> void:
+## Fill a side from a battalion preset, `per` men a company (or, with keep_sizes, companies that
+## already exist keep their size). The company being edited stays selected.
+func set_battalion(t: int, bname: String, per: int = 10, keep_sizes := false) -> void:
 	var spec: Array = BATTALIONS.get(bname, BATTALIONS["Line battalion"])
 	var old: Array = companies[t] if t < companies.size() and companies[t] is Array else []
 	var cos := []
 	for c in spec.size():
 		var row: Array = spec[c]
-		var n: int = int(old[c]["size"]) if c < old.size() else per
+		var n: int = int(old[c]["size"]) if keep_sizes and c < old.size() else per
 		cos.append(new_company(t, c, row[0], row[1], row[2], n))
 	companies[t] = cos
 	battalion_names[t] = bname
