@@ -140,17 +140,19 @@ func new_company(t: int, c: int, persona_name: String, type_name: String, slot: 
 		"type": SoldierType.preset(type_name), "type_name": type_name, "slot": slot}
 
 
-## Fill a side from a battalion preset, `per` men a company.
+## Fill a side from a battalion preset, `per` men a company. Companies that already exist keep
+## their size, and the company being edited stays selected.
 func set_battalion(t: int, bname: String, per: int = 10) -> void:
 	var spec: Array = BATTALIONS.get(bname, BATTALIONS["Line battalion"])
+	var old: Array = companies[t] if t < companies.size() and companies[t] is Array else []
 	var cos := []
 	for c in spec.size():
 		var row: Array = spec[c]
-		cos.append(new_company(t, c, row[0], row[1], row[2], per))
+		var n: int = int(old[c]["size"]) if c < old.size() else per
+		cos.append(new_company(t, c, row[0], row[1], row[2], n))
 	companies[t] = cos
 	battalion_names[t] = bname
-	sel[t] = 0
-	select_company(t, 0)
+	select_company(t, clampi(sel[t], 0, cos.size() - 1))
 
 
 ## Load a company into the one-company view the editor works on.

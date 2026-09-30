@@ -446,7 +446,7 @@ func _build_team_panel(t: int) -> Control:
 		b.add_theme_font_size_override("font_size", 14)
 		b.tooltip_text = MatchManager.BATTALION_HELP.get(bn, "")
 		b.pressed.connect(func():
-			manager.set_battalion(t, bn, int(manager.companies[t][0]["size"]))
+			manager.set_battalion(t, bn, int(manager.companies[t][manager.sel[t]]["size"]))
 			_refresh_sliders(t))
 		brow.add_child(b)
 		_bat_chips[t][bn] = b
