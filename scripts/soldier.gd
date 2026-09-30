@@ -681,6 +681,7 @@ func _build_body() -> void:
 	body_root.add_child(arm_r)
 	leg_l = _leg(trouser, -0.14)
 	leg_r = _leg(trouser, 0.14)
+	_add_markings(torso, cap)
 	# the rifle: stock, barrel, bayonet
 	rifle = Node3D.new()
 	rifle.position = Vector3(0.22, 1.3, -0.25)
@@ -736,12 +737,13 @@ func _build_body() -> void:
 
 	label = Label3D.new()
 	label.text = soldier_name if rounds == 0 else "%s *%d" % [soldier_name, rounds]   # *n: rounds survived
-	label.font_size = 26
-	label.pixel_size = 0.012
+	label.font_size = 24
+	label.pixel_size = 0.0045
+	label.outline_size = 4
 	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	label.no_depth_test = true
 	label.position = Vector3(0, 2.35, 0)
-	label.modulate = Color(1, 1, 1, 0.85)
+	label.modulate = Color(1, 1, 1, 0.7)
 	add_child(label)
 	# hp bar
 	var bar_bg := MeshInstance3D.new()
@@ -758,6 +760,62 @@ func _build_body() -> void:
 	_bar_fg.material_override = _bar_material(Color(0.3, 0.9, 0.3, 0.95), 2)
 	_bar_fg.position = Vector3(0, 2.12, 0.001)
 	add_child(_bar_fg)
+
+
+## Stripes, spots and the rest, by company, so the units can be told apart at a glance.
+func _add_markings(torso: Node3D, cap: MeshInstance3D) -> void:
+	var mk: Dictionary = MatchManager.mark_for(company)
+	var mm := StandardMaterial3D.new()
+	mm.albedo_color = mk["color"]
+	var cap_band := MeshInstance3D.new()          # every company wears its colour round the cap
+	cap_band.mesh = _box(Vector3(0.34, 0.05, 0.36))
+	cap_band.material_override = mm
+	cap_band.position = Vector3(0, -0.05, 0)
+	cap.add_child(cap_band)
+	for side in [-1.0, 1.0]:                      # front (-z) and back (+z)
+		var z: float = 0.155 * side
+		match String(mk["pattern"]):
+			"sash":
+				_mark(torso, mm, Vector3(0.52, 0.1, 0.02), Vector3(0, 0.02, z))
+			"spots":
+				for p in [Vector2(-0.13, 0.17), Vector2(0.13, 0.17), Vector2(0, 0.0), Vector2(-0.13, -0.17), Vector2(0.13, -0.17)]:
+					_mark(torso, mm, Vector3(0.09, 0.09, 0.02), Vector3(p.x, p.y, z), true)
+			"stripes":
+				for x in [-0.15, 0.0, 0.15]:
+					_mark(torso, mm, Vector3(0.05, 0.62, 0.02), Vector3(x, 0, z))
+			"bands":
+				_mark(torso, mm, Vector3(0.52, 0.06, 0.02), Vector3(0, 0.12, z))
+				_mark(torso, mm, Vector3(0.52, 0.06, 0.02), Vector3(0, -0.12, z))
+			"cross":
+				for a in [0.62, -0.62]:
+					var b := _mark(torso, mm, Vector3(0.07, 0.8, 0.02), Vector3(0, 0, z))
+					b.rotation.z = a
+			"chevron":
+				for a in [0.6, -0.6]:
+					for dy in [0.1, -0.06]:
+						var b := _mark(torso, mm, Vector3(0.3, 0.06, 0.02), Vector3(-0.1 * signf(a), dy, z))
+						b.rotation.z = a
+	if String(mk["pattern"]) == "bands" or String(mk["pattern"]) == "stripes":
+		for arm in [arm_l, arm_r]:               # a band round each sleeve too
+			_mark(arm, mm, Vector3(0.16, 0.08, 0.16), Vector3(0, 0.1, 0))
+
+
+func _mark(parent: Node3D, mat: Material, size: Vector3, pos: Vector3, round_spot := false) -> MeshInstance3D:
+	var m := MeshInstance3D.new()
+	if round_spot:
+		var sp := SphereMesh.new()
+		sp.radius = size.x * 0.5
+		sp.height = size.x
+		sp.radial_segments = 8
+		sp.rings = 4
+		m.mesh = sp
+		m.scale = Vector3(1, 1, 0.3)
+	else:
+		m.mesh = _box(size)
+	m.material_override = mat
+	m.position = pos
+	parent.add_child(m)
+	return m
 
 
 func _leg(mat: Material, x: float) -> Node3D:

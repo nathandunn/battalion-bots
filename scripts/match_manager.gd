@@ -32,6 +32,22 @@ const BATTALION_HELP := {
 	"Old guard": "Three companies of veterans and a screen of marksmen",
 }
 const TEAM_NAMES := ["Red", "Blue"]
+## How each company is told apart on the field: a pattern and an accent colour, by company index.
+## pattern: sash | spots | stripes | bands | cross | chevron
+const MARKS := [
+	{"name": "white sash", "pattern": "sash", "color": Color(0.95, 0.95, 0.92)},
+	{"name": "yellow spots", "pattern": "spots", "color": Color(0.98, 0.85, 0.2)},
+	{"name": "black stripes", "pattern": "stripes", "color": Color(0.08, 0.08, 0.1)},
+	{"name": "white sleeve bands", "pattern": "bands", "color": Color(0.95, 0.95, 0.92)},
+	{"name": "gold cross-belts", "pattern": "cross", "color": Color(0.9, 0.7, 0.15)},
+	{"name": "green chevrons", "pattern": "chevron", "color": Color(0.25, 0.75, 0.35)},
+]
+
+
+static func mark_for(c: int) -> Dictionary:
+	return MARKS[c % MARKS.size()]
+
+
 const TEAM_COLORS := [Color(0.8, 0.22, 0.2), Color(0.2, 0.35, 0.8)]
 const SERGEANT_TICK := 0.5
 const VOLLEY_COOLDOWN := 2.5
@@ -294,8 +310,8 @@ func start_match(seed_value: int = -1) -> void:
 				lab.no_depth_test = true
 				lab.fixed_size = true
 				lab.pixel_size = 0.0022
-				lab.font_size = 34
-				lab.outline_size = 10
+				lab.font_size = 16
+				lab.outline_size = 4
 				lab.modulate = TEAM_COLORS[t].lightened(0.45)
 				lab.text = String(co["name"])
 				lab.position = Vector3(band_x(t, c), z0 + 5.0, z0)

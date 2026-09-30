@@ -510,6 +510,7 @@ func _build_team_panel(t: int) -> Control:
 	var sl := Label.new()
 	sl.text = "Men: %d" % int(manager.team_sizes[t])
 	sl.custom_minimum_size = Vector2(90, 0)
+	sl.add_theme_font_size_override("font_size", 15)
 	size_row.add_child(sl)
 	size_labels.append(sl)
 	var size_slider := HSlider.new()
@@ -518,7 +519,9 @@ func _build_team_panel(t: int) -> Control:
 	size_slider.step = 1
 	size_slider.value = int(manager.team_sizes[t])
 	size_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	size_slider.custom_minimum_size = Vector2(0, 32)
+	size_slider.custom_minimum_size = Vector2(0, 40)
+	size_slider.tick_count = 5
+	size_slider.ticks_on_borders = true
 	size_slider.value_changed.connect(func(v: float):
 		if _updating:
 			return
@@ -719,7 +722,7 @@ func _rebuild_strip(t: int) -> void:
 		var b := Button.new()
 		b.toggle_mode = true
 		b.button_pressed = c == manager.sel[t]
-		b.text = "%s · %d men\n%s / %s\n%s" % [co["name"], int(co["size"]), co["persona_name"], co["type_name"], co["slot"]]
+		b.text = "%s · %d men\n%s / %s\n%s\n%s" % [co["name"], int(co["size"]), co["persona_name"], co["type_name"], co["slot"], MatchManager.mark_for(c)["name"]]
 		b.custom_minimum_size = Vector2(118, 0)
 		b.add_theme_font_size_override("font_size", 13)
 		b.pressed.connect(func():
